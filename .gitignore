@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+config.local.json
+.env
+.venv/
+runs/
+*.log

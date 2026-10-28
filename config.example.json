@@ -1,0 +1,16 @@
+{
+  "game_path": "../Fincard",
+  "godot_path": "godot_console",
+  "base_url": "https://api.openai.com/v1",
+  "model": "",
+  "api_key_env": "FINCARD_AI_API_KEY",
+  "scenario": "example_country",
+  "seed": 0,
+  "step_delay": 2.0,
+  "max_decisions": 250,
+  "max_completion_tokens": 1200,
+  "token_parameter": "max_tokens",
+  "send_screenshots": false,
+  "save_screenshots": true,
+  "window_size": "1280x720"
+}
