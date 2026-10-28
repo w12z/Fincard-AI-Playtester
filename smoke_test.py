@@ -23,6 +23,12 @@ def main():
         menu = bridge.observe()
         assert menu["screen"] == "menu"
         state = bridge.act(menu, {"kind": "start_run", "scenario": "arcadia"})
+        assert state['scenario_description']
+        assert state['goal_conditions'] and state['failure_conditions']
+        assert state['goal_timing']['deadline_turn'] == 40
+        assert state['goal_timing']['earliest_win_turn'] == 24
+        assert any(event['turn'] == 16 and event['phase'] == 'turn_end' for event in state['fixed_event_forecast'])
+        assert all('effects' not in event and 'choices' not in event for event in state['fixed_event_forecast'])
         observed = set()
         plays = 0
         for step in range(args.steps):

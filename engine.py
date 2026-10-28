@@ -24,18 +24,27 @@ ROOT = Path(__file__).resolve().parent
 
 SYSTEM_PROMPT = """你是Fincard的试玩玩家和体验评审，用中文简短解释选择。
 你只能使用给出的玩家可见信息，不能假设知道牌库顺序、未来随机事件或隐藏种子。
+scenario_description是国家背景；fixed_event_forecast是试玩规则说明提供的固定剧情时间线，可据此准备危机，但它不包含未来随机结果。
+每步先检查goal、goal_conditions、failure_conditions与goal_timing，兼顾胜利期限和危机前后的资源储备。
 若本步没有附截图，不得声称看到了界面布局、颜色或动画；只能评价规则、文字信息与决策体验。
 目标是在期限内完成国家目标并避免失败，同时记录真实体验中的困惑和有趣组合。
 每回合可以连续出多张牌，预算按年发放、政治点按回合重置，援助使用后消耗。
+每次只执行一个动作；下一次决策必须重新按current_costs和当前political_capital核算，不能把下回合重置的政治点提前花掉。减预算不等于减政治点。
 先处理事件、奖励、保留/弃牌等选择。改革一次性；效果细节以当前卡面和修正为准。
 不要只看单张收益，也考虑出牌顺序、费用减免、计数触发和跨回合投资。
-每次仅选一个legal_actions中的完整对象，不能创造动作或修改参数。
-只返回JSON：{"action":{...},"reason":"玩家看得懂的选择理由，最多120字", "feedback":"本步真实困惑/体验发现，没有就为空"}。
-动作必须和legal_actions的一项完全一致。不要输出代码或Markdown。"""
+每次仅从action_choices选一个动作，返回其action_index（从0开始的整数）；由程序复制完整合法动作，不要手工抄写动作字段。
+只返回JSON：{"action_index":0,"reason":"玩家看得懂的选择理由，最多120字", "feedback":"本步真实困惑/体验发现，没有就为空"}。
+action_index必须来自本次action_choices，旧步骤编号不能复用。不要输出多个动作、代码或Markdown。"""
 
 
 class SafeError(RuntimeError):
     """Safe to show in UI without leaking credentials or provider responses."""
+
+
+class DecisionError(SafeError):
+    def __init__(self, message: str, diagnostic: dict):
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 def load_config(path: Path | None = None) -> dict:
@@ -272,7 +281,9 @@ class ModelClient:
             raise SafeError("模型没有返回可读内容，请检查接口兼容性或提高输出token上限。") from None
 
     def decide(self, observation: dict, history: list[dict], screenshot: bytes | None = None) -> dict:
-        content = json.dumps({"observation": observation, "recent_decisions": history[-6:]}, ensure_ascii=False)
+        actions = observation.get("legal_actions", [])
+        content = json.dumps({"observation": observation, "recent_decisions": history[-6:],
+                              "action_choices": [{"action_index": index, "action": action} for index, action in enumerate(actions)]}, ensure_ascii=False)
         user_content: str | list = content
         if screenshot:
             user_content = [{"type": "text", "text": content}, {"type": "image_url", "image_url": {
@@ -284,13 +295,37 @@ class ModelClient:
             text = "\n".join(lines[1:-1])
         try:
             decision = json.loads(text)
+        except (ValueError, TypeError):
+            self._reject_decision("invalid_json", "模型回复不是有效JSON，未执行动作", response, observation)
+        if not isinstance(decision, dict):
+            self._reject_decision("invalid_schema", "模型回复必须是一个JSON对象，不能返回动作列表", response, observation)
+        if "action_index" in decision:
+            index = decision["action_index"]
+            if type(index) is not int or not 0 <= index < len(actions):
+                self._reject_decision("invalid_index", "模型选择的动作编号不在本次合法列表中", response, observation)
+            action = actions[index]
+            if "action" in decision and decision["action"] != action:
+                self._reject_decision("conflicting_action", "模型的动作编号与动作内容互相冲突", response, observation)
+        elif "action" in decision:
+            # Accept the previous format for compatible models and existing integrations.
             action = decision["action"]
-            if action not in observation["legal_actions"]:
-                raise ValueError()
-            return {"action": action, "reason": str(decision.get("reason", ""))[:1000],
-                    "feedback": str(decision.get("feedback", ""))[:1000]}
-        except (ValueError, KeyError, TypeError):
-            raise SafeError("模型返回了无效JSON或非法动作，未执行任何操作；已暂停。") from None
+            if type(action) is int and 0 <= action < len(actions):
+                action = actions[action]
+            elif not isinstance(action, dict) or action not in actions:
+                self._reject_decision("illegal_action", "模型返回的动作不在当前合法列表中，可能是资源不足、卡牌不在手中或字段抄错", response, observation)
+        else:
+            self._reject_decision("missing_action", "模型没有返回action_index或兼容格式action", response, observation)
+        return {"action": dict(action), "reason": str(decision.get("reason", ""))[:1000],
+                "feedback": str(decision.get("feedback", ""))[:1000]}
+
+    def _reject_decision(self, category: str, message: str, response: str, observation: dict):
+        redacted = response.replace(self.key, "[REDACTED]") if self.key else response
+        diagnostic = {"category": category, "turn": observation.get("turn"),
+                      "request_number": self.request_count, "budget": observation.get("budget"),
+                      "political_capital": observation.get("political_capital"),
+                      "revision": observation.get("revision"), "model_response": redacted[:16000],
+                      "legal_actions": observation.get("legal_actions", [])}
+        raise DecisionError(message + "；已暂停，不自动重试。", diagnostic)
 
     def report(self, final_state: dict, decisions: list[dict]) -> str:
         evidence = [{"step": index + 1, "turn": row["before"].get("turn"),
@@ -330,6 +365,11 @@ class Session:
 
     def capture(self, data: bytes, step: int):
         (self.directory / f"step-{step:04d}.png").write_bytes(data)
+
+    def save_diagnostic(self, diagnostic: dict) -> Path:
+        path = self.directory / ("model-error-" + datetime.now().strftime("%H%M%S-%f") + ".json")
+        path.write_text(json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
 
     def summary(self, usage: list[dict] | None = None):
         state = self.last_state

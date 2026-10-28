@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from engine import GameProcess, ModelClient, ROOT, SafeError, Session, deepseek_preset, load_config
+from engine import DecisionError, GameProcess, ModelClient, ROOT, SafeError, Session, deepseek_preset, load_config
 
 
 class Cancelled(Exception):
@@ -280,6 +280,9 @@ class Dashboard:
             self.messages.put(("status", "AI正在思考……暂停可阻止返回的决策被执行。"))
             try:
                 decision = self.model.decide(observation, self.session.history, png)
+            except DecisionError as error:
+                path = self.session.save_diagnostic(error.diagnostic)
+                raise SafeError(str(error) + "\n本地脱敏诊断：" + str(path)) from None
             finally:
                 self.session.summary(self.model.usage)
                 (self.session.directory / "request-count.json").write_text(json.dumps({"requests_sent": self.model.request_count}), encoding="utf-8")
@@ -297,6 +300,7 @@ class Dashboard:
             after = bridge.act(observation, decision["action"])
             self.session.record(observation, decision, after, "model")
             self.session.summary(self.model.usage)
+            self.messages.put(("log", f"已执行成功：{decision['action']['kind']}；预算 {after.get('budget', '—')}，政治点 {after.get('political_capital', '—')}。"))
             if config.get("save_screenshots", True):
                 self.session.capture(bridge.screenshot(), len(self.session.decisions))
             self.messages.put(("state", after))

@@ -3,7 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 import unittest
 
-from engine import ModelClient, SafeError, chat_endpoint, deepseek_preset, validate_endpoint
+from engine import DecisionError, ModelClient, SafeError, chat_endpoint, deepseek_preset, validate_endpoint
 
 
 class MockProvider(BaseHTTPRequestHandler):
@@ -68,6 +68,63 @@ class ModelTests(unittest.TestCase):
         MockProvider.content = 'not json'
         with self.assertRaises(SafeError):
             self.model.decide(self.observation, [])
+
+    def test_action_index_copies_exact_current_legal_action(self):
+        observation = {'legal_actions': [
+            {'kind': 'claim_reward', 'group_index': 0, 'option_index': 1, 'token': 'fresh-token'},
+            {'kind': 'end_turn'},
+        ]}
+        MockProvider.content = '{"action_index":0,"reason":"领取奖励","feedback":""}'
+        result = self.model.decide(observation, [])
+        self.assertEqual(result['action'], observation['legal_actions'][0])
+        self.assertIsNot(result['action'], observation['legal_actions'][0])
+        prompt = json.loads(MockProvider.requests[0][1]['messages'][-1]['content'])
+        self.assertEqual(prompt['action_choices'][0]['action'], observation['legal_actions'][0])
+
+    def test_bad_indices_are_rejected(self):
+        for index in (-1, 99, '0', True, 0.0):
+            MockProvider.content = json.dumps({'action_index': index})
+            with self.assertRaises(DecisionError) as result:
+                self.model.decide(self.observation, [])
+            self.assertEqual(result.exception.diagnostic['category'], 'invalid_index')
+
+    def test_conflicting_index_and_action_are_rejected(self):
+        MockProvider.content = '{"action_index":0,"action":{"kind":"play_card","card_id":"missing"}}'
+        with self.assertRaises(DecisionError) as result:
+            self.model.decide(self.observation, [])
+        self.assertEqual(result.exception.diagnostic['category'], 'conflicting_action')
+
+    def test_missing_action_is_explained(self):
+        MockProvider.content = '{"reason":"没有动作"}'
+        with self.assertRaises(DecisionError) as result:
+            self.model.decide(self.observation, [])
+        self.assertEqual(result.exception.diagnostic['category'], 'missing_action')
+
+    def test_json_array_is_not_executed_as_multiple_actions(self):
+        MockProvider.content = '[{"action_index":0},{"action_index":0}]'
+        with self.assertRaises(DecisionError) as result:
+            self.model.decide(self.observation, [])
+        self.assertEqual(result.exception.diagnostic['category'], 'invalid_schema')
+
+    def test_diagnostics_redact_key_and_keep_legal_context(self):
+        self.model.key = 'sensitive-test-key'
+        MockProvider.content = 'not json sensitive-test-key'
+        with self.assertRaises(DecisionError) as result:
+            self.model.decide(self.observation, [])
+        diagnostic = result.exception.diagnostic
+        self.assertNotIn(self.model.key, json.dumps(diagnostic))
+        self.assertEqual(diagnostic['legal_actions'], self.observation['legal_actions'])
+        self.assertEqual(diagnostic['category'], 'invalid_json')
+
+    def test_goal_and_crisis_briefing_are_sent_on_every_decision(self):
+        observation = {**self.observation, 'goal': 'GDP >= 210',
+                       'goal_timing': {'deadline_turn': 40},
+                       'fixed_event_forecast': [{'turn': 16, 'title': '危机'}]}
+        MockProvider.content = '{"action_index":0}'
+        self.model.decide(observation, [])
+        prompt = json.loads(MockProvider.requests[-1][1]['messages'][-1]['content'])
+        self.assertEqual(prompt['observation']['fixed_event_forecast'][0]['turn'], 16)
+        self.assertEqual(prompt['observation']['goal_timing']['deadline_turn'], 40)
 
     def test_no_retry_no_response_leak(self):
         MockProvider.status = 429

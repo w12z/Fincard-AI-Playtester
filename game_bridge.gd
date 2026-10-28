@@ -176,6 +176,7 @@ func _observe() -> Dictionary:
 	var state := sim.state
 	var scenario: ScenarioDef = controller.scenarios[state.scenario_id]
 	result.merge({"screen": "game", "scenario": String(state.scenario_id), "year": state.year,
+		"scenario_name": scenario.display_name, "scenario_description": scenario.description,
 		"turn": state.turn, "turn_in_year": state.turn_in_year, "run_status": state.run_status,
 		"budget": state.budget, "political_capital": state.political_capital,
 		"annual_income": sim.annual_income(), "deck_count": state.deck.size(),
@@ -183,6 +184,14 @@ func _observe() -> Dictionary:
 		"goal": scenario.goal.description, "loss_reason": state.flags.get("loss_reason", ""),
 		"flight_active": ui._flight_active, "hand": [], "modifiers": [], "aids": [], "cabinets": [],
 		"pending_rewards": [], "played_cards": []})
+	var turns_per_year := int(controller.rules.get("turns_per_year", 8))
+	result["goal_timing"] = {
+		"deadline_years": scenario.goal.deadline_years,
+		"deadline_turn": scenario.goal.deadline_years * turns_per_year,
+		"earliest_win_turn": scenario.goal.after_turn + 1,
+		"turns_remaining": maxi(0, scenario.goal.deadline_years * turns_per_year - state.turn),
+	}
+	result["fixed_event_forecast"] = _fixed_event_forecast(scenario, state.turn)
 	var goals: Array = []
 	for condition in scenario.goal.conditions:
 		goals.append({"text": TextFormatter.condition_text(controller.labels, condition), "met": condition.evaluate(state, sim.economy)})
@@ -283,6 +292,27 @@ func _observe() -> Dictionary:
 		actions.append({"kind": "end_turn"})
 		result["forecast"] = EconomyForecast.text(sim, controller.labels)
 	return result
+
+
+func _fixed_event_forecast(scenario: ScenarioDef, current_turn: int) -> Array:
+	# Explicit playtest briefing requested by the user: deterministic scenario
+	# milestones, not random outcomes, choice effects, reward draws or deck order.
+	var forecast: Array = []
+	var event_turns := scenario.scheduled_events.keys()
+	event_turns.sort()
+	for event_turn in event_turns:
+		if int(event_turn) < current_turn:
+			continue
+		var id := StringName(scenario.scheduled_events[event_turn])
+		var event: EconomyEventDef = _main.controller.events.get(id)
+		if event == null:
+			continue
+		forecast.append({
+			"turn": int(event_turn), "turns_until": int(event_turn) - current_turn,
+			"phase": String(scenario.scheduled_event_phases.get(event_turn, &"turn_start")),
+			"title": event.title, "description": event.description,
+		})
+	return forecast
 
 
 func _add_hand_actions(actions: Array, kind: String, skippable: bool) -> void:

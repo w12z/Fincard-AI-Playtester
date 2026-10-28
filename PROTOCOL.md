@@ -13,6 +13,8 @@ Response: `{"ok":true,"observation":{...}}`.
 Observation includes protocol version, opaque `revision`, player-visible state, current decision and `legal_actions`.
 It does not expose deck order, RNG state, future random events, or seed. The revision may change after manual input or animation; its only meaning is freshness.
 
+Each in-game observation includes `scenario_description`, `goal`, `goal_conditions`, `failure_conditions`, and `goal_timing` (deadline, earliest win and remaining turns). At the user's request, `fixed_event_forecast` also supplies deterministic scenario milestones: turn, phase, title and description. It is an explicit playtest briefing shown in the dashboard, not a prediction of random outcomes. Event choice effects and reward draws are not revealed in advance.
+
 ## Act
 
 Copy one entire action from the latest observation:
