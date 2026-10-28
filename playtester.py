@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from engine import GameProcess, ModelClient, ROOT, SafeError, Session, load_config
+from engine import GameProcess, ModelClient, ROOT, SafeError, Session, deepseek_preset, load_config
 
 
 class Cancelled(Exception):
@@ -61,7 +61,21 @@ class Dashboard:
         ttk.Entry(settings, textvariable=self.fields["max_decisions"]).grid(row=7, column=1, sticky="ew", padx=6)
         self.vision = tk.BooleanVar(value=config.get("send_screenshots", False))
         ttk.Checkbutton(settings, text="发送游戏截图给模型（需视觉模型，会增加费用）", variable=self.vision).grid(row=8, column=0, columnspan=2, sticky="w", pady=5)
-        ttk.Button(settings, text="保存设置（不含密钥）", command=self.save).grid(row=9, column=0, columnspan=2, sticky="w")
+        compatibility = ttk.Frame(settings)
+        compatibility.grid(row=9, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Button(compatibility, text="使用DeepSeek Flash预设", command=self.apply_deepseek).pack(side="left")
+        self.fields["provider"] = tk.StringVar(value=config.get("provider", "auto"))
+        ttk.Combobox(compatibility, textvariable=self.fields["provider"], values=["auto", "deepseek"], state="readonly", width=9).pack(side="left", padx=5)
+        ttk.Label(compatibility, text="  DeepSeek思考模式：").pack(side="left")
+        self.fields["thinking_mode"] = tk.StringVar(value=config.get("thinking_mode", "disabled"))
+        ttk.Combobox(compatibility, textvariable=self.fields["thinking_mode"], values=["disabled", "low", "high", "max"], state="readonly", width=10).pack(side="left")
+        self.fields["max_completion_tokens"] = tk.StringVar(value=str(config.get("max_completion_tokens", 1200)))
+        ttk.Label(settings, text="输出token上限").grid(row=10, column=0, sticky="w")
+        ttk.Entry(settings, textvariable=self.fields["max_completion_tokens"]).grid(row=10, column=1, sticky="ew", padx=6)
+        save_bar = ttk.Frame(settings)
+        save_bar.grid(row=11, column=0, columnspan=2, sticky="ew", pady=4)
+        ttk.Button(save_bar, text="保存设置（不含密钥）", command=self.save).pack(side="left")
+        ttk.Button(save_bar, text="测试模型接口（一次请求）", command=self.test_model).pack(side="left", padx=6)
         settings.columnconfigure(1, weight=1)
         bar = ttk.Frame(root)
         bar.pack(fill="x", padx=10)
@@ -90,13 +104,59 @@ class Dashboard:
         try:
             config["step_delay"] = float(config["step_delay"])
             config["max_decisions"] = int(config["max_decisions"])
+            config["max_completion_tokens"] = int(config["max_completion_tokens"])
             if not 0.3 <= config["step_delay"] <= 60 or not 1 <= config["max_decisions"] <= 5000:
                 raise ValueError()
+            if not 1 <= config["max_completion_tokens"] <= 393216:
+                raise ValueError()
         except ValueError:
-            raise SafeError("展示时间应在0.3～60秒，调用上限应在1～5000之间。") from None
+            raise SafeError("展示时间应在0.3～60秒，调用上限应在1～5000之间，token上限应为1～393216的整数。") from None
         config["game_path"] = str(Path(config["game_path"]).expanduser().resolve())
         config["send_screenshots"] = self.vision.get()
         return config
+
+    def apply_deepseek(self):
+        if self.busy:
+            messagebox.showinfo("兼容预设", "请先暂停，等待当前请求完成后再切换。")
+            return
+        self.autoplay = False
+        self.config = deepseek_preset(self.config)
+        for key in ("provider", "base_url", "model", "thinking_mode", "max_completion_tokens"):
+            self.fields[key].set(str(self.config[key]))
+        self.consented = False
+        self.status.set("已设置DeepSeek Flash：请填写DeepSeek Key，先点击“测试模型接口”。")
+        self._log("DeepSeek预设：官方地址、deepseek-flash、max_tokens；默认关闭思考以避免1200 token只够输出推理。若启用low/high/max，请把输出token上限提高至至少8192。密钥仍仅保存在本地内存。")
+
+    def _configure_model(self):
+        config = self.read_settings()
+        model = ModelClient(config, self.key_var.get().strip())
+        if self.model is not None:
+            model.usage = self.model.usage
+            model.request_count = self.model.request_count
+        self.config = config
+        self.model = model
+
+    def test_model(self):
+        if self.busy:
+            return
+        self.autoplay = False
+        try:
+            self._configure_model()
+            if self.model.request_count >= int(self.config["max_decisions"]):
+                raise SafeError("已达到调用上限，请提高上限后再测试。")
+        except SafeError as error:
+            messagebox.showerror("模型设置", str(error))
+            return
+        if not messagebox.askokcancel("测试模型接口", "将向当前模型发送一次极小的决策请求，可能产生少量费用。不会操作游戏，不会上传截图。是否继续？"):
+            return
+        self.status.set("正在测试模型的JSON决策接口……")
+
+        def work():
+            result = self.model.decide({"screen": "connection_test", "legal_actions": [{"kind": "end_turn"}]}, [])
+            self.messages.put(("log", "模型接口测试通过：返回了合法JSON决策。此动作未发送给游戏。\n" + result["reason"]))
+            self.messages.put(("status", "模型接口兼容检查通过，可以启动游戏并开始AI试玩。"))
+
+        self._worker(work)
 
     def _log(self, text: str):
         self.log.insert("end", text + "\n\n")
@@ -170,18 +230,17 @@ class Dashboard:
         if self.busy:
             return False
         try:
-            self.config = self.read_settings()
-            # Never reset usage to bypass the per-session request cap.
-            if self.model is None:
-                self.model = ModelClient(self.config, self.key_var.get().strip())
+            self._configure_model()
         except SafeError as error:
             messagebox.showerror("模型设置", str(error))
             return False
-        if not getattr(self, "consented", False):
+        signature = (self.model.endpoint, self.model.model, self.model.thinking_mode, self.config["send_screenshots"])
+        if not getattr(self, "consented", False) or getattr(self, "consent_signature", signature) != signature:
             kind = "局面信息及游戏截图" if self.config["send_screenshots"] else "玩家可见局面信息（不含截图）"
             if not messagebox.askokcancel("确认模型调用", f"将发送{kind}到你配置的模型服务。\n每个决策一次请求，可能产生费用；不自动重试。\n截图和记录仅保存在本地，不自动上传GitHub。\n\n是否继续？"):
                 return False
             self.consented = True
+        self.consent_signature = signature
         return True
 
     def start(self):

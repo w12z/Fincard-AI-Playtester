@@ -31,6 +31,34 @@
 
 ## 快速启动
 
+### 使用 DeepSeek Flash
+
+1. 打开控制台，点击 **使用DeepSeek Flash预设**。
+2. 地址会设为`https://api.deepseek.com`，模型为 **`deepseek-flash`**；填入DeepSeek平台的Key。
+3. 点击 **测试模型接口（一次请求）**。此测试会明确确认收费，不操作游戏，也不发送截图。
+4. 测试通过后，正常启动游戏、AI单步或连续试玩。
+
+也可不操作预设按钮，直接使用专用配置：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "你的DeepSeek密钥"
+python playtester.py --config config.deepseek.example.json
+```
+
+兼容处理包括：使用`max_tokens`、明确发送`stream: false`、只为决策启用`response_format: json_object`、报告保留Markdown，并区分最终`content`与`reasoning_content`。
+地址支持官方根地址、`/v1`以及完整`/chat/completions`地址，避免重复拼接。
+
+**默认关闭DeepSeek思考模式**，让1200 token上限用于最终JSON答案。官方接口默认开启思考，较小的token预算可能耗尽在推理部分。
+如需更强推理，可选择`low`／`high`／`max`，并手动把输出上限设为至少8192。这是本工具的防截断保护，不是官方接口的最低限制，也不是自动增费；上限不足时不会发送请求。
+截断、空答案、仅返回思考、401密钥错误、402余额不足、404路径或模型错误、429限流均会明确提示并暂停，不会自动重试，也不会将推理文本当作游戏动作。
+
+DeepSeek专用环境变量是`DEEPSEEK_API_KEY`；手动填写密钥优先。远端第三方转发服务需支持同样的DeepSeek请求字段；若不支持，请将预设按钮旁的兼容模式切回`auto`，并填写转发服务自己的地址和模型名。
+`auto`会在官方`api.deepseek.com`地址自动启用DeepSeek兼容；其他地址保持通用OpenAI请求格式。
+
+依据：[官方调用说明](https://api-docs.deepseek.com/)、[Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion)、[思考模式](https://api-docs.deepseek.com/guides/thinking_mode)、[JSON输出](https://api-docs.deepseek.com/guides/json_mode)。
+
+### 通用接口
+
 双击 **`start.bat`**，或：
 
 ```powershell
@@ -61,7 +89,7 @@ python playtester.py
 7. 点击 **生成建议**额外请求一次模型，输出`ai-report.md`；不想继续付费，可直接看已有`summary.md`。
 
 自动模式中不要同时手动点击游戏。若检测到局面变化，AI会暂停，而不是冒险执行旧动作。
-更换模型或接口时，请重新打开控制台；启动后不会静默切换已创建的模型客户端。
+更换接口、模型或思考模式前先暂停，等待当前请求完成。再次开始／单步会应用新设置，但保留本控制台的调用计数，不会通过切换模型绕过调用上限。
 
 ## 配置与密钥
 

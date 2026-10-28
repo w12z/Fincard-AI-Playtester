@@ -1,0 +1,19 @@
+{
+  "game_path": "../Fincard",
+  "godot_path": "godot_console",
+  "provider": "deepseek",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-flash",
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "thinking_mode": "disabled",
+  "scenario": "example_country",
+  "seed": 0,
+  "step_delay": 2.0,
+  "max_decisions": 250,
+  "max_completion_tokens": 1200,
+  "token_parameter": "max_tokens",
+  "request_timeout": 180,
+  "send_screenshots": false,
+  "save_screenshots": true,
+  "window_size": "1280x720"
+}
