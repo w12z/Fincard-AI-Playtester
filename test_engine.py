@@ -1,9 +1,11 @@
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
+from pathlib import Path
+import tempfile
 import unittest
 
-from engine import DecisionError, ModelClient, SafeError, chat_endpoint, deepseek_preset, validate_endpoint
+from engine import DecisionError, ModelClient, SafeError, Session, chat_endpoint, deepseek_preset, validate_endpoint
 
 
 class MockProvider(BaseHTTPRequestHandler):
@@ -12,6 +14,7 @@ class MockProvider(BaseHTTPRequestHandler):
     requests = []
     finish_reason = 'stop'
     reasoning_content = None
+    tool_calls = None
 
     def log_message(self, *_):
         pass
@@ -24,7 +27,8 @@ class MockProvider(BaseHTTPRequestHandler):
         self.end_headers()
         if self.status == 200:
             payload = {'choices': [{'finish_reason': self.finish_reason,
-                                   'message': {'content': self.content, 'reasoning_content': self.reasoning_content}}],
+                                   'message': {'content': self.content, 'reasoning_content': self.reasoning_content,
+                                               'tool_calls': self.tool_calls}}],
                        'usage': {'total_tokens': 15}}
         else:
             payload = {'error': 'sensitive-provider-response-not-for-display'}
@@ -48,6 +52,7 @@ class ModelTests(unittest.TestCase):
         MockProvider.requests.clear()
         MockProvider.finish_reason = 'stop'
         MockProvider.reasoning_content = None
+        MockProvider.tool_calls = None
         self.model = ModelClient({'base_url': f'http://127.0.0.1:{self.server.server_port}/v1', 'model': 'test'})
         self.observation = {'legal_actions': [{'kind': 'end_turn'}]}
 
@@ -163,7 +168,9 @@ class ModelTests(unittest.TestCase):
         body = MockProvider.requests[0][1]
         self.assertEqual(body['model'], 'deepseek-flash')
         self.assertEqual(body['thinking'], {'type': 'disabled'})
-        self.assertEqual(body['response_format'], {'type': 'json_object'})
+        self.assertNotIn('response_format', body)
+        self.assertEqual(body['tools'][0]['function']['parameters']['properties']['action_index']['enum'], [0])
+        self.assertEqual(body['tool_choice']['function']['name'], 'choose_game_action')
         self.assertEqual(body['max_tokens'], 1200)
         self.assertNotIn('max_completion_tokens', body)
         self.assertNotIn('reasoning_effort', body)
@@ -179,6 +186,8 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(body['thinking'], {'type': 'enabled'})
         self.assertEqual(body['reasoning_effort'], 'low')
         self.assertEqual(body['max_tokens'], 8192)
+        self.assertNotIn('tools', body)
+        self.assertEqual(body['response_format'], {'type': 'json_object'})
 
     def test_thinking_with_small_budget_does_not_send_request(self):
         model = self.deepseek_model(thinking_mode='high')
@@ -236,6 +245,84 @@ class ModelTests(unittest.TestCase):
         parts = MockProvider.requests[0][1]['messages'][-1]['content']
         self.assertEqual(parts[1]['type'], 'image_url')
         self.assertTrue(parts[1]['image_url']['url'].startswith('data:image/png;base64,'))
+
+    def test_deepseek_named_tool_selects_only_current_enum(self):
+        MockProvider.finish_reason = 'tool_calls'
+        MockProvider.content = None
+        MockProvider.tool_calls = [{'type': 'function', 'function': {
+            'name': 'choose_game_action', 'arguments': '{"action_index":1,"reason":"选择","feedback":""}'}}]
+        observation = {'legal_actions': [{'kind': 'play_card', 'card_id': 'card'}, {'kind': 'end_turn'}]}
+        decision = self.deepseek_model().decide(observation, [])
+        self.assertEqual(decision['action'], {'kind': 'end_turn'})
+        schema = MockProvider.requests[0][1]['tools'][0]['function']['parameters']
+        self.assertEqual(schema['properties']['action_index']['enum'], [0, 1])
+        self.assertFalse(schema['additionalProperties'])
+
+    def test_deepseek_tool_out_of_range_is_not_executed(self):
+        MockProvider.tool_calls = [{'function': {'name': 'choose_game_action', 'arguments': '{"action_index":9}'}}]
+        with self.assertRaises(DecisionError):
+            self.deepseek_model().decide(self.observation, [])
+
+    def test_multiple_tool_calls_are_rejected(self):
+        MockProvider.tool_calls = [{'function': {'name': 'choose_game_action', 'arguments': '{"action_index":0}'}}] * 2
+        with self.assertRaisesRegex(SafeError, '多个'):
+            self.deepseek_model().decide(self.observation, [])
+
+    def test_unexpected_tool_is_rejected(self):
+        MockProvider.tool_calls = [{'function': {'name': 'set_budget', 'arguments': '{}'}}]
+        with self.assertRaisesRegex(SafeError, '错误的决策工具'):
+            self.deepseek_model().decide(self.observation, [])
+
+    def test_explicit_json_transport_for_gateways(self):
+        MockProvider.content = '{"action_index":0}'
+        self.deepseek_model(decision_transport='json').decide(self.observation, [])
+        body = MockProvider.requests[0][1]
+        self.assertNotIn('tools', body)
+        self.assertEqual(body['response_format'], {'type': 'json_object'})
+
+    def test_no_legal_actions_never_calls_provider(self):
+        with self.assertRaises(SafeError):
+            self.model.decide({'legal_actions': []}, [])
+        self.assertEqual(self.model.request_count, 0)
+
+    def test_new_run_does_not_send_previous_game_history(self):
+        MockProvider.content = '{"action_index":0}'
+        history = [{'action': {'kind': 'end_turn'}, 'feedback': 'previous-game-only'},
+                   {'action': {'kind': 'start_run', 'scenario': 'example_country'}, 'reason': 'new game'}]
+        self.model.decide(self.observation, history)
+        prompt = json.loads(MockProvider.requests[0][1]['messages'][-1]['content'])
+        self.assertEqual(len(prompt['recent_decisions']), 1)
+        self.assertNotIn('previous-game-only', json.dumps(prompt))
+
+    def test_session_clears_memory_after_manual_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = Session({'game_path': folder}, base=Path(folder))
+            session.current_run_id = 'old'
+            session.last_state = {'turn': 11, 'game_run_id': 'old'}
+            session.history = [{'action': {'kind': 'end_turn'}, 'feedback': 'old'}]
+            session.sync_run({'screen': 'game', 'turn': 0, 'game_run_id': 'new'})
+            self.assertEqual(session.history, [])
+            self.assertEqual(session.current_run_id, 'new')
+
+    def test_recent_history_contains_outcome_not_invented_feedback(self):
+        MockProvider.content = '{"action_index":0}'
+        self.model.decide(self.observation, [{'turn': 6, 'action': {'kind': 'play_card', 'card_id': 'example'},
+                         'reason': 'political is 99 (incorrect)', 'feedback': 'imagined UI bug',
+                         'result': {'political_after': 2, 'budget_after': 26}}])
+        prompt = json.loads(MockProvider.requests[0][1]['messages'][-1]['content'])
+        entry = prompt['recent_decisions'][0]
+        self.assertNotIn('reason', entry)
+        self.assertNotIn('feedback', entry)
+        self.assertEqual(entry['result']['political_after'], 2)
+
+    def test_session_keeps_memory_during_same_game(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = Session({'game_path': folder}, base=Path(folder))
+            session.current_run_id = 'same'
+            session.last_state = {'turn': 3}
+            session.history = [{'action': {'kind': 'end_turn'}}]
+            session.sync_run({'screen': 'game', 'turn': 4, 'game_run_id': 'same'})
+            self.assertEqual(len(session.history), 1)
 
 
 if __name__ == '__main__':

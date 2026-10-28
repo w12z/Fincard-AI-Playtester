@@ -24,12 +24,16 @@ def main():
         assert menu["screen"] == "menu"
         state = bridge.act(menu, {"kind": "start_run", "scenario": "arcadia"})
         assert state['scenario_description']
+        assert state['rules_briefing']['draw_per_turn'] == 5
+        assert state['reward_context']['free_claims']
+        assert all(g['claim_cost'] == {'budget': 0, 'political': 0} for g in state['pending_rewards'])
         assert state['goal_conditions'] and state['failure_conditions']
         assert state['goal_timing']['deadline_turn'] == 40
         assert state['goal_timing']['earliest_win_turn'] == 24
         assert any(event['turn'] == 16 and event['phase'] == 'turn_end' for event in state['fixed_event_forecast'])
         assert all('effects' not in event and 'choices' not in event for event in state['fixed_event_forecast'])
         observed = set()
+        original_run_id = state['game_run_id']
         plays = 0
         for step in range(args.steps):
             assert "deck" not in state and "seed" not in state and "rng" not in state
@@ -53,6 +57,11 @@ def main():
             state = bridge.act(state, action)
             session.record(before, {"action": action, "reason": "非AI接口检查", "feedback": ""}, state, "smoke_test")
             assert not state.get("flight_active"), "act must wait until the visual flight completes"
+            assert state['game_run_id'] == original_run_id
+            for card in state['hand']:
+                offered = {'kind': 'play_card', 'card_id': card['id']} in state['legal_actions']
+                assert card['can_play_now'] == offered
+                assert 'hand_index' in card
         # Rejected stale requests cannot silently apply an earlier model decision.
         if state["legal_actions"]:
             result = bridge.call("observe")

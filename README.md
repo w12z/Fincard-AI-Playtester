@@ -46,7 +46,8 @@ $env:DEEPSEEK_API_KEY = "你的DeepSeek密钥"
 python playtester.py --config config.deepseek.example.json
 ```
 
-兼容处理包括：使用`max_tokens`、明确发送`stream: false`、只为决策启用`response_format: json_object`、报告保留Markdown，并区分最终`content`与`reasoning_content`。
+兼容处理包括：使用`max_tokens`、明确发送`stream: false`，并区分最终`content`与`reasoning_content`。默认非思考模式的决策使用指定函数`choose_game_action`，参数中的动作编号限定为本次合法编号枚举；本地仍重新校验，不会执行越界、冲突或多个动作。报告保留Markdown，不走决策工具。
+开启思考模式时使用JSON决策，不强制指定工具（DeepSeek思考模式不支持强制工具选择）。转发网关不支持工具时，可在本地配置添加`"decision_transport": "json"`显式使用原JSON模式；不会在收费请求失败后自动重试。
 地址支持官方根地址、`/v1`以及完整`/chat/completions`地址，避免重复拼接。
 
 **默认关闭DeepSeek思考模式**，让1200 token上限用于最终JSON答案。官方接口默认开启思考，较小的token预算可能耗尽在推理部分。
@@ -96,6 +97,8 @@ python playtester.py
 - **完整评审**：点击“生成建议”并确认后，才额外请求模型生成`ai-report.md`，可在中途或结束后生成。胜负结算不会自动触发额外收费报告。
 
 `summary.md`只是已记录反馈的汇总，不是另一次模型分析。未发送截图时，反馈以规则和决策体验为主，不会声称亲眼看到未提供的画面。
+
+每步局面同时提供`rules_briefing`与阶段上下文：奖励免费、领牌去向、年度筹备后发预算、政治点重置值不是储存上限、援助领取不等于使用、手牌回合末弃掉、实际减免费用和能力生效时间等。近期记忆只带操作与实际结果，不将模型先前的猜测／抱怨当作规则反复灌回。重新开局会清空规划记忆，完整历史仍保留在日志。完整评审也会核对实际指标，不把主观反馈直接当成已证实bug。
 
 自动模式中不要同时手动点击游戏。若检测到局面变化，AI会暂停，而不是冒险执行旧动作。
 更换接口、模型或思考模式前先暂停，等待当前请求完成。再次开始／单步会应用新设置，但保留本控制台的调用计数，不会通过切换模型绕过调用上限。

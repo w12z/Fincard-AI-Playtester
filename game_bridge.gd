@@ -149,7 +149,7 @@ func _fingerprint() -> String:
 	var aids: Array = []
 	for entry in state.aids:
 		aids.append([entry["def"].id, entry["uses"]])
-	return var_to_str([state.turn, state.year, state.phase, state.run_status, state.budget,
+	return var_to_str([ui.get_instance_id(), state.turn, state.year, state.phase, state.run_status, state.budget,
 		state.political_capital, state.indicators, state.deck, state.hand, state.discard,
 		state.flags, state.pending_event, state.played_cards_this_turn, modifiers, groups, aids,
 		ui._flight_active])
@@ -176,6 +176,7 @@ func _observe() -> Dictionary:
 	var state := sim.state
 	var scenario: ScenarioDef = controller.scenarios[state.scenario_id]
 	result.merge({"screen": "game", "scenario": String(state.scenario_id), "year": state.year,
+		"game_run_id": str(ui.get_instance_id()),
 		"scenario_name": scenario.display_name, "scenario_description": scenario.description,
 		"turn": state.turn, "turn_in_year": state.turn_in_year, "run_status": state.run_status,
 		"budget": state.budget, "political_capital": state.political_capital,
@@ -192,6 +193,26 @@ func _observe() -> Dictionary:
 		"turns_remaining": maxi(0, scenario.goal.deadline_years * turns_per_year - state.turn),
 	}
 	result["fixed_event_forecast"] = _fixed_event_forecast(scenario, state.turn)
+	result["rules_briefing"] = {
+		"draw_per_turn": int(controller.rules.get("draw_per_turn", 5)),
+		"turns_per_year": turns_per_year,
+		"political_reset_per_turn": sim.political_capital_per_turn(),
+		"budget_floor": sim.budget_floor(), "budget_retention": sim.budget_retention(),
+		"aid_capacity": sim.aid_capacity(), "aid_count": sim.aid_count(),
+		"notes": [
+			"奖励领取不花预算或政治点。卡面费用仅在从手牌出牌时支付。每组分别选一项，不是所有组中只能选一项。",
+			"财年会议尚未完成时不允许出牌；全部组处理后才发年度预算，并在下一回合重置政治点。开局显示0预算、0政治点是正常筹备阶段。",
+			"预算与政治点没有3点或年收入数值这样的储存上限。政治点3是每回合重置基础值，不是上限，获得额外政治点可当回合使用。",
+			"年收入不是预算上限；援助加预算可超过年收入。预算按财年发放，结余按保留率结转；政治点余额不结转。",
+			"回合结束弃掉未用手牌，牌库空时洗回弃牌；不能假设未打出的牌下回合仍在手里。保留能力只按实际提示选择。",
+			"援助领取后放入持有栏，不会自动使用；手动使用无需预算或政治点，用后消耗。不计为投资与援助类卡牌出牌。",
+			"current_costs是当前唯一实际费用，已含减免；不可在此基础上再减一次。拿不到合法动作的牌当前就不能打。",
+			"下一张投资减预算只影响下一张符合条件的牌，不减少政治成本，不同时减免所有投资；每步执行后重新观察。",
+			"增长修正可同时叠加；同名不同剩余回合的条目均参与结算，不是只取最大值。每条独立到期，回合持续效果可跨财年。",
+			"active=false表示能力还未生效，不能用它计算当前返还；每回合一次的触发查看counter，不能重复计算。",
+			"达到全部目标且超过最早胜利回合后，在回合结束判胜；期限是最晚限制，不是必须玩满的时长。",
+		],
+	}
 	var goals: Array = []
 	for condition in scenario.goal.conditions:
 		goals.append({"text": TextFormatter.condition_text(controller.labels, condition), "met": condition.evaluate(state, sim.economy)})
@@ -200,9 +221,12 @@ func _observe() -> Dictionary:
 	for condition in scenario.goal.loss_conditions:
 		risks.append(TextFormatter.condition_text(controller.labels, condition))
 	result["failure_conditions"] = risks
-	for id in state.hand:
+	for hand_index in state.hand.size():
+		var id: StringName = state.hand[hand_index]
 		var card := _card(id)
+		card["hand_index"] = hand_index
 		card["current_costs"] = sim.card_costs(id)
+		card["can_play_now"] = sim._can_act() and not ui._hand_card_disabled(card["current_costs"])
 		result["hand"].append(card)
 	for id in state.played_cards_this_turn:
 		result["played_cards"].append(_card(id))
@@ -218,7 +242,8 @@ func _observe() -> Dictionary:
 		result["modifiers"].append({"target": String(modifier.target), "scope": String(modifier.scope),
 			"source": String(modifier.source), "operation": Modifier.op_label(modifier.op),
 			"value": modifier.value, "stacks": modifier.stacks, "remaining_turns": modifier.remaining_turns,
-			"active": modifier.is_active(state.turn), "description": description, "counter": counter})
+			"active": modifier.is_active(state.turn), "ready_turn": modifier.ready_turn,
+			"description": description, "counter": counter})
 	for entry in state.aids:
 		var aid: AidDef = entry["def"]
 		result["aids"].append({"id": String(aid.id), "name": aid.display_name,
@@ -250,6 +275,12 @@ func _observe() -> Dictionary:
 				actions.append({"kind": "resolve_event", "choice_index": index})
 	elif not state.pending_rewards.is_empty():
 		result["decision"] = "rewards"
+		result["reward_context"] = {
+			"opening_setup": state.flags.get("opening_setup", false),
+			"annual_meeting": ui._is_annual_meeting(),
+			"free_claims": true, "pending_group_count": state.pending_rewards.size(),
+			"note": "领取不支付卡面费用；这些费用不是购买价格。先逐组处理奖励，当前阶段不能出牌。",
+		}
 		var removal_index := -1
 		for index in state.pending_rewards.size():
 			if state.pending_rewards[index].get("removal_pending", false):
@@ -258,8 +289,14 @@ func _observe() -> Dictionary:
 			var group: Dictionary = state.pending_rewards[index]
 			var token := str(group.get("token", ""))
 			var item := {"index": index, "token": token, "type": group["type"],
+				"title": group.get("title", ""), "claim_cost": {"budget": 0, "political": 0},
+				"card_destination": group.get("destination", "deck"),
+				"skip_allows_removal": int(group["type"]) == Reward.Type.CARD and not group.get("turn_reward", false) and not sim.removable_cards().is_empty(),
 				"turn_reward": group.get("turn_reward", false), "options": [],
 				"removal_pending": group.get("removal_pending", false)}
+			if group["options"].is_empty():
+				item["empty_reason"] = "援助栏已满" if int(group["type"]) == Reward.Type.AID and sim.aid_count() >= sim.aid_capacity() else "此类别没有可领取的候选"
+				item["skip_note"] = "放弃空奖励并继续流程，不会领取物品，也不改抽其他类别。"
 			for option_index in group["options"].size():
 				var option: Reward = group["options"][option_index]
 				item["options"].append(_reward(option, group))

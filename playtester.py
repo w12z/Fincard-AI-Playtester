@@ -266,6 +266,7 @@ class Dashboard:
         def work():
             bridge = self.game.bridge
             observation = bridge.observe()
+            self.session.sync_run(observation)
             self.messages.put(("state", observation))
             if observation.get("run_status") in (1, 2):
                 self.messages.put(("pause", "本局已结束。可生成建议，或直接查看本地summary.md。"))
